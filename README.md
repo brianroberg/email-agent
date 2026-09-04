@@ -408,7 +408,7 @@ The same fields apply to `POST /drafts/{draft_id}/update`, but an update **alway
 
 Response (for a reply create that resolved its conversation — a plain non-reply create reports `thread_attached: false` with the standalone draft's own fresh `thread_id`):
 ```json
-{"success": true, "draft_id": "r1234567890", "thread_id": "18d5a3b2c4e5f001", "thread_attached": true, "message": "Draft created: r1234567890", "error": null}
+{"success": true, "draft_id": "r1234567890", "thread_id": "18d5a3b2c4e5f001", "thread_attached": true, "message": "Draft created: r1234567890", "warnings": [], "id_changed": false, "error": null}
 ```
 
 ### GET /drafts
@@ -449,10 +449,15 @@ curl -X POST http://localhost:8081/drafts/{draft_id}/update \
 
 Response:
 ```json
-{"success": true, "draft_id": "r1234567890", "thread_id": "18d5a3b2c4e5f001", "thread_attached": true, "message": "Draft updated: r1234567890", "error": null}
+{"success": true, "draft_id": "r1234567890", "thread_id": "18d5a3b2c4e5f001", "thread_attached": true, "message": "Draft updated: r1234567890", "warnings": [], "id_changed": false, "error": null}
 ```
 
-**Result verification:** the response is never a bare echo of the request. `draft_id` reports the id the proxy actually returned — if Gmail's `drafts.update` reissues a new id (it has), that new id is what comes back, with a `(warning: ...)` note in `message` naming both the requested and returned ids. When the update result embeds the message's headers, the Subject is also cross-checked against what was requested and a mismatch is flagged the same way. Still verify a change you care about with a follow-up `GET /drafts/{draft_id}` when it matters — this check catches identity/subject drift the proxy's response itself reveals, not everything that could go wrong server-side.
+**Result verification:** the response is never a bare echo of the request.
+
+- **Identity.** `draft_id` reports the id the proxy actually returned. If Gmail's `drafts.update` ever reissues a new id (issue #3's suspicion; not observed since), `id_changed` is `true`, `draft_id` carries the new id to use from then on, and a warning names both ids. A result with no id at all keeps the requested id and warns that it is assumed rather than confirmed — unless the read-back then finds that id gone (404), in which case a single warning says the requested id no longer resolves and was probably reissued, and tells the caller to list drafts to find the current one (`thread_attached` is `false`: nothing about that draft is confirmed). Only a non-blank string or an integer counts as an id in the result; `false`, `1.5`, `{}` and the like are treated as "no id", not stringified.
+- **Content.** Gmail's `drafts.update` response (which the proxy forwards verbatim) carries only ids, never the stored message, so after the write the server reads the draft back (`GET /drafts/{id}?format=raw` — the whole stored RFC 2822 message in one round-trip) and compares it with the message it sent: **Subject** (RFC 2047-decoded and Unicode-normalised, so an accented or curly-quoted subject that came back encoded-word is not a false alarm), **To / Cc / Bcc** (as sets of addresses — display names and address case are Gmail's to rewrite), and the **plain-text body** (whitespace-normalised; the body is never quoted in a warning). A differing, blank or missing Subject, a changed or dropped recipient list, or a different body (issue #3's gutted-draft case had all three) each produce their own `draft content mismatch` warning. A read-back that could not be performed, or that carried no decodable stored message, produces a distinct `could not verify draft content` warning instead — unverified is not verified, but it is also not a verdict that the draft is wrong.
+
+Every warning appears twice: as a `(warning: ...)` note in `message`, and as an entry in `warnings` (a list of strings) for callers that want to branch without parsing prose. **Warnings never turn a successful update into `success: false`** — by then Gmail has applied the write, and a failure report would invite a retry that duplicates it; structurally, nothing that runs after the write shares a `try` with the code that maps exceptions to failures. Every update therefore costs one extra proxy round-trip (the read-back) on top of the pre-update thread read; the read-back is capped at 10 s (the proxy client's own timeout is 30 s), and hitting the cap is reported as `could not verify`.
 
 ### DELETE /drafts/{draft_id}
 

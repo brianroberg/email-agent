@@ -6,6 +6,7 @@ They have no framework or authentication dependencies.
 
 import base64
 import re
+import unicodedata
 from email.utils import formataddr, getaddresses
 from typing import Optional
 
@@ -107,6 +108,14 @@ def parse_address_list(header_value: str) -> list[str]:
 def get_header(headers: list, name: str) -> str:
     """Extract a header value from Gmail message headers.
 
+    Strict on shape: a header list whose entries are not dicts with 'name'
+    and 'value' raises (KeyError/TypeError), so a read endpoint reports the
+    malformed data as an error instead of returning success with a blank
+    subject, sender or Message-ID -- a blank Message-ID handed back as
+    in_reply_to would silently produce an unthreaded reply draft. The
+    post-update draft read-back does not use this function; it parses the
+    stored raw message instead.
+
     Args:
         headers: List of header dicts with 'name' and 'value' keys
         name: Header name to find (case-insensitive)
@@ -118,6 +127,19 @@ def get_header(headers: list, name: str) -> str:
         if header["name"].lower() == name.lower():
             return header["value"]
     return ""
+
+
+def normalize_header_text(value: str) -> str:
+    """Canonicalise header text for comparison, not display.
+
+    Unicode NFC (so 'é' as one code point equals 'e' + combining acute),
+    format characters dropped (zero-width space/joiner and the like are
+    invisible and carry no content), and whitespace runs -- including
+    header folding -- collapsed to single spaces.
+    """
+    text = unicodedata.normalize("NFC", str(value))
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
+    return " ".join(text.split())
 
 
 def decode_body(payload: dict) -> str:

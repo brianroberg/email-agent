@@ -2244,8 +2244,93 @@ class TestProxyClient:
         assert headers["Content-Type"] == "application/json"
 
 
+class TestMalformedHeaderShapesFailLoud:
+    """Review finding 9: get_header leniency added for the update read-back
+    leaked into /search, GET /drafts and GET /drafts/{id}, which had
+    surfaced a malformed header shape as success=false and started
+    returning success=true with a blank subject / from_addr /
+    rfc822_message_id -- a blank rfc822_message_id fed back as in_reply_to
+    yields an unthreaded draft. Read endpoints report the malformed data
+    as an error; the read-back path no longer uses get_header at all."""
+
+    MALFORMED = [
+        [None],
+        ["not a dict"],
+        [{"value": "Subject with no name"}],
+        [{"name": "Subject"}],
+    ]
+
+    @pytest.mark.parametrize("headers", MALFORMED)
+    @patch("email_server.get_gmail_client")
+    def test_search_with_malformed_header_shape_fails_loud(self, mock_get_client, client, headers):
+        mock_proxy = AsyncMock()
+        mock_get_client.return_value = mock_proxy
+        mock_proxy.list_messages.return_value = {"messages": [{"id": "msg123", "threadId": "t1"}]}
+        mock_proxy.get_message.return_value = {
+            "id": "msg123", "threadId": "t1", "snippet": "", "labelIds": [],
+            "payload": {"headers": headers, "body": {"data": ""}},
+        }
+
+        data = client.post("/search", json={"limit": 1}).json()
+
+        assert data["success"] is False, data
+        assert data["messages"] == []
+        assert data["error"]
+
+    @pytest.mark.parametrize("headers", MALFORMED)
+    @patch("email_server.get_gmail_client")
+    def test_get_draft_with_malformed_header_shape_fails_loud(self, mock_get_client, client, headers):
+        mock_proxy = AsyncMock()
+        mock_get_client.return_value = mock_proxy
+        mock_proxy.get_draft.return_value = {
+            "id": "r123",
+            "message": {"id": "m1", "threadId": "t1", "payload": {"headers": headers, "body": {"data": ""}}},
+        }
+
+        data = client.get("/drafts/r123").json()
+
+        assert data["success"] is False, data
+        assert data["error"]
+
+    @pytest.mark.parametrize("headers", MALFORMED)
+    def test_get_header_is_strict_again(self, headers):
+        from gmail_utils import get_header
+
+        with pytest.raises((KeyError, TypeError)):
+            get_header(headers, "Subject")
+
+
 class TestProxyErrorHandling:
     """Tests for proxy error handling."""
+
+    def test_404_raises_proxy_not_found_error_which_is_a_proxy_error(self):
+        """Review finding 6: the update read-back needs to tell a draft
+        that no longer exists apart from any other failure. A 404 raises
+        ProxyNotFoundError, a ProxyError subclass so every existing
+        `except ProxyError` still applies."""
+        import httpx
+        from proxy_client import GmailProxyClient, ProxyError, ProxyNotFoundError
+
+        assert issubclass(ProxyNotFoundError, ProxyError)
+        response = httpx.Response(
+            404,
+            json={"error": "not_found", "message": "Draft not found"},
+            request=httpx.Request("GET", "http://proxy/gmail/v1/users/me/drafts/r123"),
+        )
+
+        with pytest.raises(ProxyNotFoundError, match="Draft not found"):
+            GmailProxyClient(api_key="aproxy_test123")._handle_response(response)
+
+    def test_other_4xx_still_raises_plain_proxy_error(self):
+        import httpx
+        from proxy_client import GmailProxyClient, ProxyError, ProxyNotFoundError
+
+        response = httpx.Response(
+            400, json={"message": "bad"}, request=httpx.Request("GET", "http://proxy/x")
+        )
+        with pytest.raises(ProxyError) as excinfo:
+            GmailProxyClient(api_key="aproxy_test123")._handle_response(response)
+        assert not isinstance(excinfo.value, ProxyNotFoundError)
 
     @patch("email_server.get_gmail_client")
     def test_proxy_auth_error_formatted(self, mock_get_client, client):
