@@ -277,7 +277,15 @@ curl -X POST http://localhost:8081/trash \
 
 Response:
 ```json
-{"success": true, "message": "Email moved to Trash"}
+{"success": true, "message": "Email moved to Trash", "error": null}
+```
+
+The proxy holds the request open while the operator decides, so this call waits **up to 330 s** for the proxy's answer (`APPROVAL_GATE_TIMEOUT` in `proxy_client.py`, sized to outlast the proxy's default 300 s approval window) — much longer than the 30 s used for ungated calls. Give it that long on the calling side too: a client-side timeout shorter than the approval window reports failure for a trash that may then be approved and go through.
+
+If the operator declines the request at the approval gate — or the proxy's approval window expires with no decision; the proxy reports both the same way — the response is the documented error envelope (HTTP 200, `success: false`), not an HTTP error:
+
+```json
+{"success": false, "message": "Email not moved to Trash: the proxy declined the request (approval not granted)", "error": "Operation blocked: Request rejected by operator"}
 ```
 
 ### POST /untrash
@@ -292,8 +300,10 @@ curl -X POST http://localhost:8081/untrash \
 
 Response:
 ```json
-{"success": true, "message": "Email removed from Trash"}
+{"success": true, "message": "Email removed from Trash", "error": null}
 ```
+
+This route is approval-gated too: the same 330 s wait and the same `success: false` decline envelope as `POST /trash` apply.
 
 ### POST /batch-summarize
 
@@ -371,7 +381,8 @@ Request body:
 Supported operations:
 - `mark_read` - Remove UNREAD label
 - `archive` - Remove INBOX label
-- `apply_label:LABEL_NAME` - Add the specified label (e.g., `apply_label:IMPORTANT`)
+- `trash` - Move the email to Trash through the proxy's approval-gated trash route (the same path as `POST /trash`). The proxy has no batch approval, so a bulk trash is **one operator approval per message**, decided in sequence; the request returns only after every message has been decided, and each `trash` waits up to 330 s for its decision (see `POST /trash`). A declined message gets `"trash: Operation blocked: Request rejected by operator"` in its `error` and the remaining messages are still attempted. Applying `TRASH` as a label is not an alternative — see below.
+- `apply_label:LABEL_NAME` - Add the specified label (e.g., `apply_label:IMPORTANT`); `TRASH`/`SPAM` are rejected (see `POST /apply-label`)
 
 Response:
 ```json
@@ -503,6 +514,8 @@ Error prefixes indicate the type:
 - `Authentication error:` - Invalid or missing API key (proxy returned 401)
 - `Operation blocked:` - Operation not allowed or confirmation rejected (proxy returned 403)
 - `Proxy error:` - Backend or server error (proxy returned 5xx)
+
+`POST /trash` and `POST /untrash` return this envelope (HTTP 200, `success: false`, plus a `message`) when the proxy declines at its approval gate. Other failures on the single-action endpoints (`/mark-read`, `/apply-label`, `/archive`, `/trash`, `/untrash`) are still HTTP 500 with a `detail` string.
 
 ## Development
 

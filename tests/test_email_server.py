@@ -2285,3 +2285,141 @@ class TestProxyErrorHandling:
 
         assert data["success"] is False
         assert "Proxy error" in data["error"]
+
+
+class TestResolveLabelIdRefusesTrashSpam:
+    """The TRASH/SPAM refusal lives in resolve_label_id itself (one place),
+    so every route that resolves a label -- /apply-label, /bulk-actions, and
+    any future label route -- inherits it instead of re-implementing it.
+    Applying TRASH/SPAM as a label bypasses the proxy's approval gate for
+    destructive operations (api-proxy#2); POST /trash is the gated path."""
+
+    @pytest.mark.parametrize("label", ["TRASH", "SPAM", "trash", "Spam"])
+    async def test_resolve_label_id_refuses_trash_and_spam(self, label):
+        from email_server import resolve_label_id
+
+        mock_proxy_client = AsyncMock()
+        with pytest.raises(ValueError, match="/trash"):
+            await resolve_label_id(mock_proxy_client, label)
+        # Refused before any proxy round-trip.
+        mock_proxy_client.list_labels.assert_not_called()
+
+    async def test_resolve_label_id_still_resolves_other_system_labels(self):
+        from email_server import resolve_label_id
+
+        mock_proxy_client = AsyncMock()
+        assert await resolve_label_id(mock_proxy_client, "starred") == "STARRED"
+        mock_proxy_client.list_labels.assert_not_called()
+
+
+class TestTrashApprovalDecline:
+    """An operator DECLINE at the proxy's approval gate is a normal outcome of
+    a gated operation, not a server fault. The proxy answers it with
+    403 {"error": "forbidden", "message": "Request rejected by operator"}
+    (the same 403 when its approval window expires). /trash and /untrash
+    must surface that in the README's documented error envelope
+    (success=false + an "Operation blocked:" error), not as HTTP 500."""
+
+    @patch("email_server.get_gmail_client")
+    @pytest.mark.parametrize("route,method", [
+        ("/trash", "trash_message"),
+        ("/untrash", "untrash_message"),
+    ])
+    def test_operator_decline_returns_documented_envelope(
+        self, mock_get_client, client, route, method
+    ):
+        from proxy_client import ProxyForbiddenError
+
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        getattr(mock_proxy_client, method).side_effect = ProxyForbiddenError(
+            "Request rejected by operator"
+        )
+
+        response = client.post(route, json={"email_id": "msg123"})
+        assert response.status_code == 200, response.text
+
+        data = response.json()
+        assert data["success"] is False
+        assert data["error"].startswith("Operation blocked:")
+        assert "Request rejected by operator" in data["error"]
+
+    @patch("email_server.get_gmail_client")
+    def test_trash_success_envelope_has_null_error(self, mock_get_client, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.trash_message.return_value = {"id": "msg123"}
+
+        data = client.post("/trash", json={"email_id": "msg123"}).json()
+        assert data["success"] is True
+        assert data["error"] is None
+
+    @patch("email_server.get_gmail_client")
+    def test_trash_non_gate_failures_still_500(self, mock_get_client, client):
+        """Only the gate decision is mapped; a broken proxy is still a 500."""
+        from proxy_client import ProxyError
+
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.trash_message.side_effect = ProxyError("Proxy error: 502")
+
+        response = client.post("/trash", json={"email_id": "msg123"})
+        assert response.status_code == 500
+
+
+class TestBulkActionsTrash:
+    """`trash` as a /bulk-actions operation. Each message goes through
+    client.trash_message -- the proxy's approval-gated trash route -- so a
+    bulk trash is N gated calls (the proxy has no batch approval), never
+    the ungated TRASH-label trick."""
+
+    @patch("email_server.get_gmail_client")
+    def test_bulk_trash_routes_each_message_through_gated_trash(
+        self, mock_get_client, client
+    ):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+
+        response = client.post("/bulk-actions", json={
+            "actions": [
+                {"email_id": "msg_a", "operations": ["trash"]},
+                {"email_id": "msg_b", "operations": ["mark_read", "trash"]},
+            ]
+        })
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["error_count"] == 0, data
+        assert data["success_count"] == 2
+
+        trashed = [c.args[0] for c in mock_proxy_client.trash_message.call_args_list]
+        assert trashed == ["msg_a", "msg_b"]
+        # mark_read is the only label modification; TRASH is never a label here.
+        mock_proxy_client.modify_message.assert_called_once()
+        for c in mock_proxy_client.modify_message.call_args_list:
+            assert "TRASH" not in (c.kwargs.get("add_label_ids") or [])
+
+    @patch("email_server.get_gmail_client")
+    def test_bulk_trash_operator_decline_is_per_message(self, mock_get_client, client):
+        from proxy_client import ProxyForbiddenError
+
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.trash_message.side_effect = [
+            ProxyForbiddenError("Request rejected by operator"),
+            {"id": "msg_b"},
+        ]
+
+        data = client.post("/bulk-actions", json={
+            "actions": [
+                {"email_id": "msg_a", "operations": ["trash"]},
+                {"email_id": "msg_b", "operations": ["trash"]},
+            ]
+        }).json()
+
+        assert data["success"] is True  # overall request always 200s
+        assert data["success_count"] == 1
+        assert data["error_count"] == 1
+        assert data["results"][0]["success"] is False
+        assert "Operation blocked: Request rejected by operator" in data["results"][0]["error"]
+        assert data["results"][1]["success"] is True

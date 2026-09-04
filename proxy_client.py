@@ -18,6 +18,17 @@ load_dotenv()
 PROXY_URL = os.environ.get("PROXY_URL", "http://host.docker.internal:8000")
 PROXY_API_KEY = os.environ.get("PROXY_API_KEY", "")
 
+# Approval-gated proxy routes (trash/untrash in the proxy's default MODIFY
+# confirmation mode) hold the HTTP request open until a human decides, for up
+# to the proxy's confirmation window (api-proxy Config.confirmation_timeout,
+# default 300 s; an expired window is answered with the same 403 as a
+# decline). The read timeout on those calls must outlast that window —
+# otherwise a slow-but-approved decision surfaces here as a timeout error
+# while the trash still goes through on the proxy side. Connect stays short so
+# a dead proxy still fails fast. Applied per gated call only; every other call
+# keeps the 30 s default below.
+APPROVAL_GATE_TIMEOUT = httpx.Timeout(330.0, connect=10.0)
+
 
 class ProxyAuthError(Exception):
     """Raised when proxy returns 401 Unauthorized."""
@@ -200,7 +211,8 @@ class GmailProxyClient:
         """
         url = f"{self.proxy_url}/gmail/v1/users/{user_id}/messages/{message_id}/trash"
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        # Gated route: wait out the proxy's approval window (see APPROVAL_GATE_TIMEOUT).
+        async with httpx.AsyncClient(timeout=APPROVAL_GATE_TIMEOUT) as client:
             response = await client.post(url, headers=self._get_headers())
             return self._handle_response(response)
 
@@ -216,7 +228,8 @@ class GmailProxyClient:
         """
         url = f"{self.proxy_url}/gmail/v1/users/{user_id}/messages/{message_id}/untrash"
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        # Gated route: wait out the proxy's approval window (see APPROVAL_GATE_TIMEOUT).
+        async with httpx.AsyncClient(timeout=APPROVAL_GATE_TIMEOUT) as client:
             response = await client.post(url, headers=self._get_headers())
             return self._handle_response(response)
 

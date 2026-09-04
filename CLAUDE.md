@@ -74,10 +74,10 @@ The test suite uses mocked proxy client and LLM responses - no credentials requi
 - `POST /mark-read` - Mark email as read
 - `POST /apply-label` - Apply a label to an email (rejects TRASH/SPAM — use /trash instead, which routes through the proxy's approval gate)
 - `POST /archive` - Archive an email
-- `POST /trash` - Move an email to Trash via the proxy's gated trash route (the sanctioned delete path)
-- `POST /untrash` - Remove an email from Trash
+- `POST /trash` - Move an email to Trash via the proxy's gated trash route (the sanctioned delete path). Waits up to 330 s for the operator's decision (`APPROVAL_GATE_TIMEOUT` in `proxy_client.py`, sized to outlast the proxy's 300 s approval window); a decline returns `success: false` with an `Operation blocked:` error, not a 500
+- `POST /untrash` - Remove an email from Trash (gated the same way as `/trash`)
 - `POST /batch-summarize` - Summarize multiple emails with triage info (detected_action, detected_deadline)
-- `POST /bulk-actions` - Apply multiple operations to multiple emails
+- `POST /bulk-actions` - Apply multiple operations to multiple emails (`mark_read`, `archive`, `trash`, `apply_label:NAME`; `trash` is one approval-gated proxy call per message, so N messages means N operator approvals)
 - `POST /drafts/create` - Create a new email draft from structured fields (reply drafts auto-attach to the original Gmail thread via `in_reply_to`/`references` resolution)
 - `GET /drafts` - List all drafts with preview info
 - `GET /drafts/{draft_id}` - Get full details of a specific draft
