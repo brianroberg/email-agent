@@ -56,7 +56,7 @@ The test suite uses mocked proxy client and LLM responses - no credentials requi
 
 ## Key Design Decisions
 
-1. **Privacy**: Email bodies are processed locally via a local LLM (Qwen3-14B). The calling agent only sees metadata and summaries.
+1. **Privacy**: Email bodies are processed locally via the local LLM at `MLX_URL` (model `MLX_MODEL`). The calling agent only sees metadata and summaries.
 
 2. **Proxy Architecture**: All Gmail API requests go through a proxy server that handles Google OAuth and human-in-the-loop controls. The agent no longer possesses a Google auth token.
 
@@ -93,7 +93,7 @@ Copy `.env.example` to `.env` and configure:
 - `MLX_URL` - Local LLM endpoint (default: `http://localhost:8080/v1/chat/completions`)
 - `MLX_MODEL` - Model name (default: `qwen/qwen3-14b`)
 - `LLM_MAX_TOKENS` - Token budget per LLM completion, reasoning + answer (default: `4096`)
-- `LLM_BACKEND_NAME` - Product name of the server behind `MLX_URL`, used only in diagnostic/error text (default: `Ollama`)
+- `LLM_BACKEND_NAME` - Product name of the server behind `MLX_URL`, used only in diagnostic/error text ("Cannot reach {name} at {MLX_URL} ..."). Set it to what is actually deployed, e.g. `Ollama` (default: `the model server`)
 
 ## Proxy Server
 

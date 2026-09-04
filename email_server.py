@@ -44,10 +44,18 @@ MLX_MODEL = os.environ.get("MLX_MODEL", "qwen/qwen3-14b")
 LLM_TIMEOUT_SECONDS = 120.0
 LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "4096"))
 # Product name of the model server behind MLX_URL, used only in diagnostic
-# text. The env var name is a historical leftover from an MLX-era default;
-# the actual backend (Ollama, port 11434) is configurable and error messages
-# must name whatever is actually deployed, not a hardcoded product.
-LLM_BACKEND_NAME = os.environ.get("LLM_BACKEND_NAME", "Ollama")
+# text (see _backend()). The MLX_* env var names are a historical leftover from
+# an MLX-era default; the actual backend and its port are whatever MLX_URL
+# points at, so the default is a neutral phrase and a deployment sets the real
+# name alongside MLX_URL (e.g. LLM_BACKEND_NAME=Ollama).
+LLM_BACKEND_NAME = os.environ.get("LLM_BACKEND_NAME", "the model server")
+
+
+def _backend() -> str:
+    """'<LLM_BACKEND_NAME> at <MLX_URL>' -- the one phrase every LLM
+    diagnostic uses to identify the backend, so an operator always sees both
+    what to check and where. Reads the module constants at call time."""
+    return f"{LLM_BACKEND_NAME} at {MLX_URL}"
 
 # Qwen3 wraps chain-of-thought in <think> tags - strip them from output
 THINKING_PATTERN = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
@@ -86,6 +94,14 @@ async def lifespan(_app: FastAPI):
         file=sys.stderr,
         flush=True,
     )
+    if LLM_BACKEND_NAME == "the model server":
+        print(
+            "email-agent: WARN LLM_BACKEND_NAME is unset -- LLM diagnostics "
+            "will say 'the model server' instead of naming the actual "
+            "backend; set LLM_BACKEND_NAME to what is actually deployed",
+            file=sys.stderr,
+            flush=True,
+        )
     yield
 
 
@@ -93,7 +109,7 @@ app = FastAPI(title="Email Agent Server v2", version="2.0", lifespan=lifespan)
 
 
 class LLMError(Exception):
-    """Base class for local LLM (MLX) errors. Messages are already actionable."""
+    """Base class for local LLM backend errors. Messages are already actionable."""
 
 
 class LLMUnreachableError(LLMError):
@@ -364,7 +380,8 @@ class GetDraftResponse(BaseModel):
 
 
 async def call_local_llm(system_prompt: str, user_content: str) -> LLMResult:
-    """Call the local LLM (Qwen3-14B via MLX) for summarization or Q&A.
+    """Call the local LLM backend (OpenAI-style chat completions at MLX_URL,
+    model MLX_MODEL) for summarization or Q&A.
 
     Args:
         system_prompt: System prompt defining the task
@@ -394,22 +411,22 @@ async def call_local_llm(system_prompt: str, user_content: str) -> LLMResult:
         # slow model — route it to the reachability diagnostic, and catch it
         # here because it is also a TimeoutException subclass.
         raise LLMUnreachableError(
-            f"Cannot reach the LLM backend at {MLX_URL}. Check that "
-            f"{LLM_BACKEND_NAME} is running and the host is reachable on "
-            f"Tailscale (try `tailscale ping <host>` from this machine). "
+            f"Cannot reach {_backend()}. Check that it is running and the "
+            f"host is reachable on Tailscale (try `tailscale ping <host>` "
+            f"from this machine). "
             f"Underlying httpx error: {type(e).__name__}: {e!s}"
         ) from e
     except httpx.TimeoutException as e:
         raise LLMTimeoutError(
-            f"The LLM backend at {MLX_URL} did not respond within "
+            f"Timed out waiting for {_backend()}: it did not respond within "
             f"{LLM_TIMEOUT_SECONDS:.0f}s. The model may be cold-loading on "
-            f"first use; retry, or check {LLM_BACKEND_NAME} logs on the host."
+            f"first use; retry, or check its logs on the host."
         ) from e
     except httpx.TransportError as e:
         raise LLMUnreachableError(
-            f"Connection to the LLM backend at {MLX_URL} failed mid-request "
+            f"Connection to {_backend()} failed mid-request "
             f"({type(e).__name__}: {e!s}). The server may have crashed or "
-            f"dropped the connection; check {LLM_BACKEND_NAME} on the host."
+            f"dropped the connection; check it on the host."
         ) from e
 
     try:
@@ -417,9 +434,9 @@ async def call_local_llm(system_prompt: str, user_content: str) -> LLMResult:
     except httpx.HTTPStatusError as e:
         body_preview = e.response.text[:200].replace("\n", " ")
         raise LLMHTTPError(
-            f"The LLM backend at {MLX_URL} returned HTTP {e.response.status_code}. "
+            f"HTTP {e.response.status_code} from {_backend()}. "
             f"Body: {body_preview!r}. "
-            f"Common causes: model {MLX_MODEL!r} not loaded in {LLM_BACKEND_NAME} "
+            f"Common causes: model {MLX_MODEL!r} not loaded there "
             f"(check /v1/models), or the server is still loading."
         ) from e
 
@@ -433,8 +450,8 @@ async def call_local_llm(system_prompt: str, user_content: str) -> LLMResult:
     except (ValueError, KeyError, IndexError, TypeError, AttributeError) as e:
         body_preview = response.text[:200].replace("\n", " ")
         raise LLMMalformedResponseError(
-            f"The LLM backend at {MLX_URL} returned HTTP 200 with an "
-            f"unexpected body (not an OpenAI-style chat completion). "
+            f"HTTP 200 with an unexpected body from {_backend()} "
+            f"(not an OpenAI-style chat completion). "
             f"Body: {body_preview!r}."
         ) from e
 
@@ -452,7 +469,7 @@ async def call_local_llm(system_prompt: str, user_content: str) -> LLMResult:
     # reasoning is truncated mid-thought and not a usable answer.
     if reasoning and finish_reason == "stop":
         print(
-            f"WARN: {LLM_BACKEND_NAME} returned empty content; using "
+            f"WARN: empty content from {_backend()}; using "
             f"reasoning_content fallback (finish_reason={finish_reason})",
             file=sys.stderr,
             flush=True,
@@ -466,7 +483,7 @@ async def call_local_llm(system_prompt: str, user_content: str) -> LLMResult:
     else:
         note = ""
     raise LLMEmptyResponseError(
-        f"{LLM_BACKEND_NAME} returned empty completion "
+        f"Got an empty completion from {_backend()} "
         f"(finish_reason={finish_reason}, model={MLX_MODEL})."
         f"{note} "
         f"If finish_reason='length', max_tokens ({LLM_MAX_TOKENS}) "

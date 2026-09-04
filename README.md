@@ -11,9 +11,9 @@ Claude Code (cloud, orchestrator)
     ▼
 email_server.py (local FastAPI server, port 8081)
     │                        │
-    │ Proxy API (API key)    │ Local LLM (MLX, port 8080)
+    │ Proxy API (API key)    │ Local LLM (OpenAI-style API at MLX_URL)
     ▼                        ▼
-api-proxy (handles OAuth)   Qwen3-14B (summarize/ask-about only)
+api-proxy (handles OAuth)   the local LLM at MLX_URL (model MLX_MODEL; summarize/ask-about only)
     │
     │ Gmail API (OAuth)
     ▼
@@ -56,7 +56,13 @@ No separate install step needed. The `uv run` command automatically manages depe
 | `MLX_URL` | No | `http://localhost:8080/v1/chat/completions` | Local LLM endpoint |
 | `MLX_MODEL` | No | `qwen/qwen3-14b` | Model name for LLM requests |
 | `LLM_MAX_TOKENS` | No | `4096` | Token budget per LLM completion (reasoning + answer) |
-| `LLM_BACKEND_NAME` | No | `Ollama` | Product name of the server behind `MLX_URL`, used only in diagnostic/error text (e.g. "Check that {name} is running") |
+| `LLM_BACKEND_NAME` | No | `the model server` | Product name of the server behind `MLX_URL`, used only in diagnostic/error text ("Cannot reach {name} at {MLX_URL} ..."). Set it to what is actually deployed (e.g. `Ollama`) so errors name the right thing |
+
+### OAuth Setup
+
+`GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` are required by the one-time `setup_oauth.py`
+script (run on a machine with a browser to produce `token.json`) — they are not read by
+`email_server.py` itself, so they're not in the table above.
 
 ## Usage
 

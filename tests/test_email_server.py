@@ -7,11 +7,34 @@ Testing patterns inspired by datasette-enrichments:
 - Edge case and error handling tests
 """
 
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 from unittest.mock import Mock, patch, AsyncMock
 
 from email_server import LLMResult
 from tests.conftest import SAMPLE_MESSAGES
+
+
+def _run_subprocess_import(code: str, env: dict | None = None) -> subprocess.CompletedProcess:
+    """Run `code` via `python -c` from the repo root and return the completed
+    process. Shared by tests that need to observe env-var-driven behavior at
+    module-import time (pytest has already imported email_server once, so an
+    in-process re-import can't exercise a different environment). `env=None`
+    inherits the current process environment unchanged; pass a dict to
+    replace it entirely."""
+    kwargs = {} if env is None else {"env": env}
+    return subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        cwd=Path(__file__).resolve().parents[1],
+        **kwargs,
+    )
 
 
 class TestHealthEndpoint:
@@ -1008,23 +1031,6 @@ class TestCallLocalLLM:
             assert result.degraded is False
 
     @pytest.mark.asyncio
-    async def test_call_local_llm_raises_unreachable_on_connect_error(self):
-        import httpx
-        from email_server import call_local_llm, LLMUnreachableError
-
-        with patch.object(
-            httpx.AsyncClient, "post", new_callable=AsyncMock
-        ) as mock_post:
-            mock_post.side_effect = httpx.ConnectError("All connection attempts failed")
-            with pytest.raises(LLMUnreachableError) as exc_info:
-                await call_local_llm("System prompt", "User content")
-            msg = str(exc_info.value)
-            assert "Cannot reach the LLM backend at" in msg
-            assert "Ollama" in msg
-            assert "LM Studio" not in msg
-            assert "All connection attempts failed" in msg
-
-    @pytest.mark.asyncio
     async def test_call_local_llm_raises_timeout_on_read_timeout(self):
         import httpx
         from email_server import call_local_llm, LLMTimeoutError
@@ -1348,7 +1354,7 @@ class TestCallLocalLLM:
             with pytest.raises(LLMUnreachableError) as exc_info:
                 await call_local_llm("System prompt", "User content")
             msg = str(exc_info.value)
-            assert "Cannot reach the LLM backend at" in msg
+            assert "Cannot reach" in msg
             assert "tailscale ping" in msg
 
     @pytest.mark.asyncio
@@ -1474,73 +1480,219 @@ class TestFormatProxyError:
 
 
 class TestLLMConfig:
-    """Tests for LLM configuration loading."""
+    """Tests for LLM configuration loading.
 
-    def test_llm_max_tokens_configurable_via_env(self, monkeypatch):
+    Env -> module-constant binding is checked in a subprocess. The previous
+    importlib.reload(email_server) approach rebound `app` while conftest's
+    TestClient fixture still held the old one, so test order mattered.
+    Message content is checked with patch.object on the module constant.
+    """
+
+    #: Env vars this test class overrides -- stripped from the child process's
+    #: environment before applying overrides, so a developer's own shell
+    #: exports of any of these can't leak into a result under test.
+    _CONFIG_VARS = ("LLM_BACKEND_NAME", "LLM_MAX_TOKENS", "MLX_URL", "MLX_MODEL", "PROXY_URL")
+
+    @classmethod
+    def _import_constant(cls, name: str, env_overrides: dict) -> str:
+        env = {k: v for k, v in os.environ.items() if k not in cls._CONFIG_VARS}
+        env.update(env_overrides)
+        result = _run_subprocess_import(
+            f"import email_server; print(repr(email_server.{name}))", env=env
+        )
+        assert result.returncode == 0, result.stderr
+        return result.stdout.strip()
+
+    def test_llm_max_tokens_configurable_via_env(self):
         """The empty-completion error tells operators to increase
         LLM_MAX_TOKENS, so it must actually be settable from the environment."""
-        import importlib
+        assert self._import_constant("LLM_MAX_TOKENS", {"LLM_MAX_TOKENS": "1234"}) == "1234"
+
+    def test_llm_backend_name_defaults_to_neutral_phrase(self):
+        """On a fresh install nothing knows what server sits behind MLX_URL
+        (the default URL is port 8080, which is not Ollama's 11434), so the
+        default must not assert a product. Deployments set LLM_BACKEND_NAME.
+
+        Checked in-process (no subprocess needed) since this only reads the
+        constant already bound at pytest's own import of email_server; the
+        subprocess machinery above exists for tests that need to rebind a
+        constant to a *different* env, which this one doesn't."""
         import email_server
 
-        monkeypatch.setenv("LLM_MAX_TOKENS", "1234")
-        try:
-            importlib.reload(email_server)
-            assert email_server.LLM_MAX_TOKENS == 1234
-        finally:
-            monkeypatch.delenv("LLM_MAX_TOKENS", raising=False)
-            importlib.reload(email_server)
+        assert email_server.LLM_BACKEND_NAME == "the model server"
 
-    def test_llm_backend_name_defaults_to_ollama(self, monkeypatch):
-        """The real backend behind MLX_URL is Ollama (port 11434), not the
-        MLX/LM Studio-era default the error messages used to name."""
-        import importlib
-        import email_server
-
-        monkeypatch.delenv("LLM_BACKEND_NAME", raising=False)
-        try:
-            importlib.reload(email_server)
-            assert email_server.LLM_BACKEND_NAME == "Ollama"
-        finally:
-            importlib.reload(email_server)
-
-    def test_llm_backend_name_configurable_via_env(self, monkeypatch):
+    def test_llm_backend_name_configurable_via_env(self):
         """Backend product name must be config-driven, not a hardcoded
         string, so a future backend swap doesn't require another code fix."""
-        import importlib
-        import email_server
-
-        monkeypatch.setenv("LLM_BACKEND_NAME", "vLLM")
-        try:
-            importlib.reload(email_server)
-            assert email_server.LLM_BACKEND_NAME == "vLLM"
-        finally:
-            monkeypatch.delenv("LLM_BACKEND_NAME", raising=False)
-            importlib.reload(email_server)
+        assert self._import_constant("LLM_BACKEND_NAME", {"LLM_BACKEND_NAME": "vLLM"}) == "'vLLM'"
 
     @pytest.mark.asyncio
-    async def test_call_local_llm_connect_error_names_configured_backend(self, monkeypatch):
+    async def test_call_local_llm_connect_error_names_configured_backend(self):
         """The connection-error hint must name whatever backend is
         configured via LLM_BACKEND_NAME, not a hardcoded product name."""
-        import importlib
+        import httpx
+        import email_server
+
+        with patch.object(email_server, "LLM_BACKEND_NAME", "vLLM"), patch.object(
+            httpx.AsyncClient, "post", new_callable=AsyncMock
+        ) as mock_post:
+            mock_post.side_effect = httpx.ConnectError("All connection attempts failed")
+            with pytest.raises(email_server.LLMUnreachableError) as exc_info:
+                await email_server.call_local_llm("System prompt", "User content")
+            msg = str(exc_info.value)
+            assert "vLLM" in msg
+            assert "Ollama" not in msg
+
+
+class TestBackendWording:
+    """Every LLM diagnostic names the configured backend AND its URL through
+    one helper, _backend(), so the messages read as one voice and an
+    operator always knows both what to check and where."""
+
+    URL = "http://llm.test/v1/chat/completions"
+
+    def test_backend_helper_names_product_and_url(self):
+        import email_server
+
+        with patch.object(email_server, "LLM_BACKEND_NAME", "TestBackend"), \
+                patch.object(email_server, "MLX_URL", self.URL):
+            assert email_server._backend() == f"TestBackend at {self.URL}"
+
+    @staticmethod
+    def _response(json_data=None, status=200, text="body"):
         import httpx
 
-        monkeypatch.setenv("LLM_BACKEND_NAME", "vLLM")
-        try:
-            import email_server
-            importlib.reload(email_server)
+        resp = Mock()
+        resp.status_code = status
+        resp.text = text
+        if status >= 400:
+            resp.raise_for_status.side_effect = httpx.HTTPStatusError(
+                "err", request=Mock(), response=resp
+            )
+        else:
+            resp.raise_for_status.return_value = None
+        resp.json.return_value = json_data if json_data is not None else {}
+        return resp
 
-            with patch.object(
-                httpx.AsyncClient, "post", new_callable=AsyncMock
-            ) as mock_post:
-                mock_post.side_effect = httpx.ConnectError("All connection attempts failed")
-                with pytest.raises(email_server.LLMUnreachableError) as exc_info:
-                    await email_server.call_local_llm("System prompt", "User content")
-                msg = str(exc_info.value)
-                assert "vLLM" in msg
-                assert "Ollama" not in msg
-        finally:
-            monkeypatch.delenv("LLM_BACKEND_NAME", raising=False)
-            importlib.reload(email_server)
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", [
+        "connect", "timeout", "transport", "http_status", "malformed", "empty_completion",
+    ])
+    async def test_every_llm_error_names_backend_and_url(self, mode):
+        import httpx
+        import email_server
+
+        post_kwargs = {
+            "connect": dict(side_effect=httpx.ConnectError("refused")),
+            "timeout": dict(side_effect=httpx.ReadTimeout("slow")),
+            "transport": dict(side_effect=httpx.RemoteProtocolError("dropped")),
+            "http_status": dict(return_value=self._response(status=500, text="boom")),
+            "malformed": dict(return_value=self._response(json_data={"nope": 1})),
+            "empty_completion": dict(return_value=self._response(json_data={
+                "choices": [{"finish_reason": "length",
+                             "message": {"content": "", "reasoning_content": ""}}]
+            })),
+        }[mode]
+
+        with patch.object(email_server, "LLM_BACKEND_NAME", "TestBackend"), \
+                patch.object(email_server, "MLX_URL", self.URL), \
+                patch.object(httpx.AsyncClient, "post", new_callable=AsyncMock, **post_kwargs):
+            with pytest.raises(email_server.LLMError) as exc_info:
+                await email_server.call_local_llm("System prompt", "User content")
+
+        msg = str(exc_info.value)
+        assert "TestBackend" in msg, msg
+        assert self.URL in msg, msg
+
+    @pytest.mark.asyncio
+    async def test_empty_content_warning_names_backend_and_url(self, capfd):
+        import httpx
+        import email_server
+
+        resp = self._response(json_data={
+            "choices": [{"finish_reason": "stop",
+                         "message": {"content": "", "reasoning_content": "salvaged"}}]
+        })
+        with patch.object(email_server, "LLM_BACKEND_NAME", "TestBackend"), \
+                patch.object(email_server, "MLX_URL", self.URL), \
+                patch.object(httpx.AsyncClient, "post", new_callable=AsyncMock, return_value=resp):
+            result = await email_server.call_local_llm("System prompt", "User content")
+
+        assert result.degraded is True
+        err = capfd.readouterr().err
+        assert "WARN" in err
+        assert "TestBackend" in err, err
+        assert self.URL in err, err
+
+
+class TestEnvVarDocParity:
+    """Every environment variable read via the two-argument
+    `os.environ.get("VAR", "default")` form in email_server.py and
+    proxy_client.py is documented, with the same default, in README.md (env
+    table), CLAUDE.md (env list) and .env.example. Guards the drift that let
+    three docs describe LLM_BACKEND_NAME three ways.
+
+    Does NOT scan setup_oauth.py or single-argument `os.environ.get("VAR")`
+    calls -- GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET (required by
+    setup_oauth.py, not read by the server) are documented separately via the
+    README "OAuth Setup" note and .env.example, outside this check."""
+
+    ENV_GET = re.compile(r'os\.environ\.get\(\s*"([A-Z_]+)"\s*,\s*"([^"]*)"\s*\)')
+
+    def _code_env_vars(self):
+        root = Path(__file__).resolve().parents[1]
+        found = {}
+        for name in ("email_server.py", "proxy_client.py"):
+            for var, default in self.ENV_GET.findall((root / name).read_text()):
+                found[var] = default
+        assert found, "no os.environ.get(...) calls found -- regex out of date?"
+        return root, found
+
+    def test_every_env_var_documented_everywhere(self, subtests):
+        root, env_vars = self._code_env_vars()
+        readme = (root / "README.md").read_text()
+        claude_md = (root / "CLAUDE.md").read_text()
+        env_example = (root / ".env.example").read_text()
+
+        for var, default in env_vars.items():
+            with subtests.test(var=var):
+                assert f"`{var}`" in readme, f"{var} missing from README env table"
+                assert f"`{var}`" in claude_md, f"{var} missing from CLAUDE.md env list"
+                assert re.search(rf"^#?\s*{var}=", env_example, re.M), (
+                    f"{var} missing from .env.example"
+                )
+
+    @staticmethod
+    def _claude_md_default_line(claude_md, var):
+        """The CLAUDE.md line documenting `var`'s default -- the first line
+        mentioning both `` `var` `` and "default:", not just the first
+        backticked mention of var (which could be unrelated prose)."""
+        for line in claude_md.splitlines():
+            if f"`{var}`" in line and "default:" in line:
+                return line
+        return None
+
+    def test_documented_defaults_match_code(self, subtests):
+        root, env_vars = self._code_env_vars()
+        readme = (root / "README.md").read_text()
+        claude_md = (root / "CLAUDE.md").read_text()
+
+        for var, default in env_vars.items():
+            if not default:
+                continue  # required vars (empty default) show "-" in the table
+            with subtests.test(var=var):
+                row = re.search(rf"^\| `{var}` \| \w+ \| `([^`]*)` \|", readme, re.M)
+                assert row, f"README env table row for {var} not found"
+                assert row.group(1) == default, (
+                    f"README says {var} defaults to {row.group(1)!r}; code says {default!r}"
+                )
+                doc_line = self._claude_md_default_line(claude_md, var)
+                assert doc_line is not None, (
+                    f"CLAUDE.md has no line documenting {var}'s default"
+                )
+                assert f"(default: `{default}`)" in doc_line, (
+                    f"CLAUDE.md line for {var} does not state (default: `{default}`): {doc_line!r}"
+                )
 
 
 class TestStartupBanner:
@@ -1548,16 +1700,7 @@ class TestStartupBanner:
 
     def test_import_does_not_print_banner(self):
         """Importing the module (pytest, tooling) must not emit the banner."""
-        import subprocess
-        import sys
-        from pathlib import Path
-
-        result = subprocess.run(
-            [sys.executable, "-c", "import email_server"],
-            capture_output=True,
-            text=True,
-            cwd=Path(__file__).resolve().parents[1],
-        )
+        result = _run_subprocess_import("import email_server")
         assert result.returncode == 0, result.stderr
         assert "email-agent: MLX_URL=" not in result.stderr
 
@@ -1571,6 +1714,34 @@ class TestStartupBanner:
 
         captured = capfd.readouterr()
         assert "email-agent: MLX_URL=" in captured.err
+
+    def test_banner_warns_when_backend_name_is_default(self, capfd):
+        """A deployment that never set LLM_BACKEND_NAME should get a
+        breadcrumb in the boot log -- otherwise the only sign is every LLM
+        diagnostic silently saying 'the model server' instead of naming the
+        actual backend, which is easy to miss until something breaks."""
+        from fastapi.testclient import TestClient
+        import email_server
+
+        with patch.object(email_server, "LLM_BACKEND_NAME", "the model server"):
+            with TestClient(email_server.app):
+                pass
+
+        captured = capfd.readouterr()
+        assert "WARN" in captured.err
+        assert "LLM_BACKEND_NAME" in captured.err
+
+    def test_banner_does_not_warn_when_backend_name_is_configured(self, capfd):
+        """No warning once a deployment has actually set LLM_BACKEND_NAME."""
+        from fastapi.testclient import TestClient
+        import email_server
+
+        with patch.object(email_server, "LLM_BACKEND_NAME", "vLLM"):
+            with TestClient(email_server.app):
+                pass
+
+        captured = capfd.readouterr()
+        assert "WARN" not in captured.err
 
 
 class TestRequestValidation:
