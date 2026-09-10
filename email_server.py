@@ -250,6 +250,9 @@ class ApplyLabelRequest(BaseModel):
 class ActionResponse(BaseModel):
     success: bool
     message: str
+    # Set (with success=false) when the proxy's approval gate declines a gated
+    # operation — see gated_action_refused / POST /trash. None on success.
+    error: Optional[str] = None
 
 
 class HealthResponse(BaseModel):
@@ -307,7 +310,31 @@ class BulkOperation(str, Enum):
     """Supported bulk operations."""
     mark_read = "mark_read"
     archive = "archive"
+    trash = "trash"  # one approval-gated proxy call per message (see /trash)
     # apply_label:LABEL_NAME is handled separately
+
+
+# The bulk operations that go through the proxy's approval gate in its
+# default (MODIFY) confirmation mode: one operator decision per message.
+# Once the gate answers one of these with a decline or an expired window,
+# the rest of them in the same request are not attempted (see bulk_actions).
+GATED_BULK_OPERATIONS = frozenset({BulkOperation.trash.value})
+
+
+def gate_answer_skip_reason(operation: str, e: ProxyForbiddenError) -> str | None:
+    """Pure: why the remaining gated operations of a bulk request are not
+    attempted after `operation` was refused with `e` -- or None when the
+    refusal is not the approval gate's answer (a disabled key, a blocked
+    path) and the request should carry on per operation as it does for
+    every other proxy error."""
+    if e.is_operator_decline:
+        return f"operator declined an earlier {operation} in this batch; re-issue if still wanted"
+    if e.is_gate_expiry:
+        return (
+            f"the approval window for an earlier {operation} in this batch expired "
+            "unanswered; re-issue if still wanted"
+        )
+    return None
 
 
 class EmailAction(BaseModel):
@@ -315,7 +342,11 @@ class EmailAction(BaseModel):
     email_id: str = Field(..., description="Email ID to act on")
     operations: list[str] = Field(
         ...,
-        description="Operations to apply: 'mark_read', 'archive', 'apply_label:LABEL_NAME'"
+        description=(
+            "Operations to apply: 'mark_read', 'archive', 'trash' (approval-gated, "
+            "one operator decision per message), 'apply_label:LABEL_NAME' "
+            "(TRASH/SPAM refused -- use 'trash')"
+        ),
     )
 
 
@@ -954,6 +985,27 @@ def draft_success_response(
     )
 
 
+# Labels whose application is refused by refuse_trash_spam (see there).
+TRASH_SPAM_LABELS = {"TRASH", "SPAM"}
+
+
+def refuse_trash_spam(label_name: str) -> None:
+    """Pure rule: raise ValueError if label_name is TRASH or SPAM.
+
+    Applying either as a label bypasses the proxy's approval gate for
+    destructive operations (api-proxy#2). POST /trash and POST /untrash are
+    the gated equivalents. Kept free of I/O so the rule is testable without
+    a client; resolve_label_id calls it first so every label route inherits
+    the refusal.
+    """
+    if label_name.upper() in TRASH_SPAM_LABELS:
+        raise ValueError(
+            f"apply_label cannot be used for '{label_name}' — this bypasses the "
+            f"proxy's approval gate for destructive operations. Use POST /trash "
+            f"(or /untrash) instead."
+        )
+
+
 async def resolve_label_id(client, label_name: str) -> str:
     """Resolve a label name to its Gmail label ID.
 
@@ -969,8 +1021,14 @@ async def resolve_label_id(client, label_name: str) -> str:
         The label ID to use with Gmail API.
 
     Raises:
-        ValueError: If the label name is not found.
+        ValueError: If the label name is TRASH or SPAM (see below), or if a
+            user label of that name is not found.
     """
+    # Refused here -- the one place every label route resolves through -- and
+    # before any proxy I/O. Any future label route inherits the refusal by
+    # going through resolve_label_id.
+    refuse_trash_spam(label_name)
+
     # System labels have IDs matching their names - check common ones first
     system_labels = {
         "INBOX", "STARRED", "IMPORTANT", "SENT", "DRAFT", "SPAM", "TRASH",
@@ -989,32 +1047,14 @@ async def resolve_label_id(client, label_name: str) -> str:
     raise ValueError(f"Label '{label_name}' not found")
 
 
-# Applying TRASH/SPAM via the label-modify path bypasses the proxy's
-# approval gate for destructive operations (see api-proxy#2) — /trash and
-# /untrash are the sanctioned, gated equivalents. Reject these labels
-# wherever apply_label is reachable (both the dedicated route and the
-# bulk-actions per-operation path) rather than in one place only.
-TRASH_SPAM_LABELS = {"TRASH", "SPAM"}
-
-
-def trash_spam_label_rejection(label_name: str) -> Optional[str]:
-    """Error text for a TRASH/SPAM apply_label attempt, or None if allowed."""
-    if label_name.upper() not in TRASH_SPAM_LABELS:
-        return None
-    return (
-        f"apply_label cannot be used for '{label_name}' — this bypasses the "
-        f"proxy's approval gate for destructive operations. Use POST /trash "
-        f"(or /untrash) instead."
-    )
-
-
 async def apply_single_operation(client, email_id: str, operation: str) -> tuple[bool, str]:
     """Apply one operation to an email.
 
     Args:
         client: GmailProxyClient instance
         email_id: The email ID to operate on
-        operation: One of 'mark_read', 'archive', or 'apply_label:LABEL_NAME'
+        operation: One of 'mark_read', 'archive', 'trash', or
+            'apply_label:LABEL_NAME'
 
     Returns:
         Tuple of (success, error_message). error_message is empty on success.
@@ -1024,20 +1064,26 @@ async def apply_single_operation(client, email_id: str, operation: str) -> tuple
             await client.modify_message(email_id, remove_label_ids=["UNREAD"])
         elif operation == "archive":
             await client.modify_message(email_id, remove_label_ids=["INBOX"])
+        elif operation == "trash":
+            # Same gated proxy route as POST /trash — the proxy has no batch
+            # approval, so a bulk trash is one operator decision per message
+            # (each waiting up to APPROVAL_GATE_TIMEOUT). A proxy refusal
+            # propagates as ProxyForbiddenError so bulk_actions can tell the
+            # gate's answer from any other 403 (see the loop there).
+            await client.trash_message(email_id)
         elif operation.startswith("apply_label:"):
             label_name = operation.split(":", 1)[1]
             if not label_name:
                 return False, "apply_label requires a label name (e.g., 'apply_label:IMPORTANT')"
-            rejection = trash_spam_label_rejection(label_name)
-            if rejection:
-                return False, rejection
-            label_id = await resolve_label_id(client, label_name)
+            label_id = await resolve_label_id(client, label_name)  # refuses TRASH/SPAM
             await client.modify_message(email_id, add_label_ids=[label_id])
         else:
             return False, f"Unknown operation: {operation}"
         return True, ""
     except ValueError as e:
         return False, str(e)
+    except ProxyForbiddenError:
+        raise  # the caller decides whether the request continues
     except Exception as e:
         return False, format_proxy_error(e)
 
@@ -1190,12 +1236,10 @@ async def mark_read(request: EmailIdRequest):
 async def apply_label(request: ApplyLabelRequest):
     """Apply a label to an email.
 
-    TRASH and SPAM are rejected here — see POST /trash and POST /untrash,
-    which route through the proxy's approval-gated trash endpoint instead.
+    TRASH and SPAM are rejected (400) by resolve_label_id — see POST /trash
+    and POST /untrash, which route through the proxy's approval-gated trash
+    endpoint instead.
     """
-    rejection = trash_spam_label_rejection(request.label_name)
-    if rejection:
-        raise HTTPException(status_code=400, detail=rejection)
     try:
         client = get_gmail_client()
         label_id = await resolve_label_id(client, request.label_name)
@@ -1220,6 +1264,26 @@ async def archive(request: EmailIdRequest):
         raise HTTPException(status_code=500, detail=format_proxy_error(e))
 
 
+def gated_action_refused(e: ProxyForbiddenError, message: str) -> ActionResponse:
+    """Map a proxy 403 on an approval-gated route (/trash, /untrash).
+
+    The operator declining at the approval gate -- or the proxy's approval
+    window expiring with no decision; the proxy answers both with the same
+    403 -- is a normal outcome of a gated operation, not a server fault, so
+    it is reported in the documented error envelope rather than as a 500: a
+    500 reads as "the service broke, retry", and a retry re-prompts the
+    operator.
+
+    Any other 403 -- a disabled API key, a blocked or non-allowlisted path --
+    is an infrastructure fault that no human decided, so it stays a 500.
+    Reporting it as a decline would tell the operator he refused a request
+    he was never shown.
+    """
+    if not e.is_operator_decline:
+        raise HTTPException(status_code=500, detail=format_proxy_error(e))
+    return ActionResponse(success=False, message=message, error=format_proxy_error(e))
+
+
 @app.post("/trash", response_model=ActionResponse)
 async def trash(request: EmailIdRequest):
     """Move an email to Trash.
@@ -1235,6 +1299,10 @@ async def trash(request: EmailIdRequest):
         await client.trash_message(request.email_id)
         return ActionResponse(success=True, message="Email moved to Trash")
 
+    except ProxyForbiddenError as e:
+        return gated_action_refused(
+            e, "Email not moved to Trash: the proxy declined the request (approval not granted)"
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=format_proxy_error(e))
 
@@ -1247,6 +1315,10 @@ async def untrash(request: EmailIdRequest):
         await client.untrash_message(request.email_id)
         return ActionResponse(success=True, message="Email removed from Trash")
 
+    except ProxyForbiddenError as e:
+        return gated_action_refused(
+            e, "Email not removed from Trash: the proxy declined the request (approval not granted)"
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=format_proxy_error(e))
 
@@ -1335,19 +1407,44 @@ async def bulk_actions(request: BulkActionsRequest):
     Supported operations:
     - mark_read: Remove UNREAD label
     - archive: Remove INBOX label
-    - apply_label:LABEL_NAME: Add the specified label
+    - trash: Move to Trash via the proxy's approval-gated trash route (one
+      approval per message; see POST /trash)
+    - apply_label:LABEL_NAME: Add the specified label (TRASH/SPAM rejected)
+
+    Once the approval gate answers a gated operation (GATED_BULK_OPERATIONS,
+    i.e. trash) with an operator decline or an expired window, the remaining
+    gated operations in the request are reported as "not attempted" and
+    never sent: continuing would queue one more prompt per remaining message
+    for an operator who has just said no or is absent, each waiting a full
+    approval window. The ungated operations (mark_read, archive,
+    apply_label) still run -- a triage batch mixes both, and skipping them
+    would leave mail unread or in the inbox. Any other proxy error,
+    including a 403 for a disabled key or a blocked path (which fails fast
+    and queues no prompt), keeps the per-operation semantics: reported on
+    that operation, the rest attempted.
     """
     try:
         client = get_gmail_client()
         results = []
         success_count = 0
         error_count = 0
+        # Set when the approval gate answers a gated operation (decline or
+        # expired window); the remaining gated operations are then skipped.
+        gate_skip: Optional[str] = None
 
         for action in request.actions:
             email_errors = []
 
             for operation in action.operations:
-                success, error = await apply_single_operation(client, action.email_id, operation)
+                if gate_skip is not None and operation in GATED_BULK_OPERATIONS:
+                    email_errors.append(f"{operation}: not attempted — {gate_skip}")
+                    continue
+                try:
+                    success, error = await apply_single_operation(client, action.email_id, operation)
+                except ProxyForbiddenError as e:
+                    success, error = False, format_proxy_error(e)
+                    if operation in GATED_BULK_OPERATIONS:
+                        gate_skip = gate_answer_skip_reason(operation, e)
                 if not success:
                     email_errors.append(f"{operation}: {error}")
 

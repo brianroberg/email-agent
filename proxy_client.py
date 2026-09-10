@@ -18,15 +18,81 @@ load_dotenv()
 PROXY_URL = os.environ.get("PROXY_URL", "http://host.docker.internal:8000")
 PROXY_API_KEY = os.environ.get("PROXY_API_KEY", "")
 
+# Approval-gated proxy routes (trash/untrash in the proxy's default MODIFY
+# confirmation mode) hold the HTTP request open until a human decides, for up
+# to the proxy's confirmation window (api-proxy `--confirmation-timeout`,
+# default 300 s, 0 = wait forever; api-proxy `main` answers an expired
+# window with the same 403 as a decline, api-proxy #9 with its own
+# `confirmation_expired` code). The read timeout on those calls must outlast that
+# window — otherwise a slow-but-approved decision surfaces here as a timeout
+# error while the trash still goes through on the proxy side. The window is
+# an operator setting on the proxy that this client cannot see, so it is
+# mirrored here: set PROXY_CONFIRMATION_TIMEOUT to the proxy's value.
+# Connect stays short so a dead proxy still fails fast. Applied per gated
+# call only; every other call keeps the 30 s default below.
+PROXY_CONFIRMATION_TIMEOUT = float(os.environ.get("PROXY_CONFIRMATION_TIMEOUT", "300"))
+APPROVAL_GATE_MARGIN_SECONDS = 30.0
+
+
+def approval_gate_timeout(window_seconds: float) -> httpx.Timeout:
+    """Pure: the httpx timeout for one approval-gated call, given the proxy's
+    confirmation window. 0 mirrors the proxy's own "no timeout" (read=None);
+    otherwise the read timeout outlasts the window by a margin."""
+    read = None if window_seconds <= 0 else window_seconds + APPROVAL_GATE_MARGIN_SECONDS
+    return httpx.Timeout(read, connect=10.0)
+
+
+APPROVAL_GATE_TIMEOUT = approval_gate_timeout(PROXY_CONFIRMATION_TIMEOUT)
+
 
 class ProxyAuthError(Exception):
     """Raised when proxy returns 401 Unauthorized."""
     pass
 
 
+# The body the proxy's approval gate answers with when the operator declines
+# a request (api-proxy gmail/handlers.py, handle_confirmation; identical on
+# api-proxy `main` and on #9's head). This is the only 403 that is a human
+# decision; the proxy also answers 403 for a disabled API key (error
+# "auth_error") and for a blocked or non-allowlisted path (error
+# "forbidden", message "This operation is not allowed").
+OPERATOR_DECLINE_CODE = "forbidden"
+OPERATOR_DECLINE_MESSAGE = "Request rejected by operator"
+# The gate's other answer: nobody decided within the approval window.
+# api-proxy #9 gives it this code; before #9 the proxy answers an expired
+# window with the decline body above, so it reads as a decline.
+GATE_EXPIRED_CODE = "confirmation_expired"
+
+
 class ProxyForbiddenError(Exception):
-    """Raised when proxy returns 403 Forbidden (blocked operation or rejected confirmation)."""
-    pass
+    """Raised when proxy returns 403 Forbidden (blocked operation, disabled
+    key, or rejected confirmation).
+
+    `code` is the proxy's `error` field (None if the body had none), kept so
+    callers can tell the approval gate's answer from an infrastructure 403.
+    """
+
+    def __init__(self, message: str, code: Optional[str] = None):
+        super().__init__(message)
+        self.code = code
+
+    @property
+    def is_operator_decline(self) -> bool:
+        """True only for the approval gate's own answer (see
+        OPERATOR_DECLINE_*). A 403 with any other code or message -- or one
+        whose body could not be parsed -- is not a human decision."""
+        return (
+            self.code == OPERATOR_DECLINE_CODE
+            and str(self) == OPERATOR_DECLINE_MESSAGE
+        )
+
+    @property
+    def is_gate_expiry(self) -> bool:
+        """True only for the gate's "nobody answered" 403 (GATE_EXPIRED_CODE,
+        api-proxy #9). Like a decline, it means no further approval prompt
+        should be raised without the operator being told; unlike a decline,
+        no human saw the request."""
+        return self.code == GATE_EXPIRED_CODE
 
 
 class ProxyError(Exception):
@@ -80,6 +146,16 @@ class GmailProxyClient:
             # Response is not valid JSON or doesn't have expected structure
             return default
 
+    def _parse_error_code(self, response: httpx.Response) -> Optional[str]:
+        """Extract the proxy's `error` code from an error body, if any."""
+        if not response.content:
+            return None
+        try:
+            code = response.json().get("error")
+        except (ValueError, AttributeError):
+            return None
+        return code if isinstance(code, str) else None
+
     def _handle_response(self, response: httpx.Response) -> dict:
         """Handle proxy response and raise appropriate exceptions.
 
@@ -101,7 +177,7 @@ class GmailProxyClient:
 
         if response.status_code == 403:
             message = self._parse_error_message(response, "Forbidden - operation blocked or rejected")
-            raise ProxyForbiddenError(message)
+            raise ProxyForbiddenError(message, code=self._parse_error_code(response))
 
         if response.status_code >= 500:
             message = self._parse_error_message(response, f"Proxy error: {response.status_code}")
@@ -213,7 +289,8 @@ class GmailProxyClient:
         """
         url = f"{self.proxy_url}/gmail/v1/users/{user_id}/messages/{message_id}/trash"
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        # Gated route: wait out the proxy's approval window (see APPROVAL_GATE_TIMEOUT).
+        async with httpx.AsyncClient(timeout=APPROVAL_GATE_TIMEOUT) as client:
             response = await client.post(url, headers=self._get_headers())
             return self._handle_response(response)
 
@@ -229,7 +306,8 @@ class GmailProxyClient:
         """
         url = f"{self.proxy_url}/gmail/v1/users/{user_id}/messages/{message_id}/untrash"
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        # Gated route: wait out the proxy's approval window (see APPROVAL_GATE_TIMEOUT).
+        async with httpx.AsyncClient(timeout=APPROVAL_GATE_TIMEOUT) as client:
             response = await client.post(url, headers=self._get_headers())
             return self._handle_response(response)
 

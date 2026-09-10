@@ -53,6 +53,7 @@ No separate install step needed. The `uv run` command automatically manages depe
 |----------|----------|---------|-------------|
 | `PROXY_API_KEY` | Yes | - | API key for proxy authentication (format: `aproxy_...`) |
 | `PROXY_URL` | No | `http://host.docker.internal:8000` | URL of the proxy server |
+| `PROXY_CONFIRMATION_TIMEOUT` | No | `300` | The proxy's approval window in seconds (its `--confirmation-timeout`; `0` = it waits forever). Must match the proxy: approval-gated calls (`/trash`, `/untrash`) wait this long plus 30 s for the operator's decision |
 | `MLX_URL` | No | `http://localhost:8080/v1/chat/completions` | Local LLM endpoint |
 | `MLX_MODEL` | No | `qwen/qwen3-14b` | Model name for LLM requests |
 | `LLM_MAX_TOKENS` | No | `4096` | Token budget per LLM completion (reasoning + answer) |
@@ -232,7 +233,7 @@ curl -X POST http://localhost:8081/mark-read \
 
 Response:
 ```json
-{"success": true, "message": "Email marked as read"}
+{"success": true, "message": "Email marked as read", "error": null}
 ```
 
 ### POST /apply-label
@@ -247,7 +248,7 @@ curl -X POST http://localhost:8081/apply-label \
 
 Response:
 ```json
-{"success": true, "message": "Label 'STARRED' applied"}
+{"success": true, "message": "Label 'STARRED' applied", "error": null}
 ```
 
 **TRASH and SPAM are rejected here (400)** — applying either via the label-modify path bypasses the proxy's approval gate for destructive operations. Use `POST /trash` (or `POST /untrash`) instead, which routes through the proxy's gated trash endpoint. The same rejection applies to `apply_label:TRASH`/`apply_label:SPAM` operations passed to `/bulk-actions`.
@@ -268,7 +269,7 @@ curl -X POST http://localhost:8081/archive \
 
 Response:
 ```json
-{"success": true, "message": "Email archived"}
+{"success": true, "message": "Email archived", "error": null}
 ```
 
 ### POST /trash
@@ -277,13 +278,22 @@ Move an email to Trash. This is the sanctioned, recoverable delete path — it c
 
 ```bash
 curl -X POST http://localhost:8081/trash \
+  --max-time 340 \
   -H "Content-Type: application/json" \
   -d '{"email_id": "18d5a3b2c4e5f6a7"}'
 ```
 
 Response:
 ```json
-{"success": true, "message": "Email moved to Trash"}
+{"success": true, "message": "Email moved to Trash", "error": null}
+```
+
+The proxy holds the request open while the operator decides, so this call waits **up to 330 s by default** for the proxy's answer (`APPROVAL_GATE_TIMEOUT` in `proxy_client.py`: the proxy's approval window, `PROXY_CONFIRMATION_TIMEOUT`, default 300 s, plus 30 s) — much longer than the 30 s used for ungated calls. The window is an operator setting on the proxy (`--confirmation-timeout`) that this service cannot see; if the proxy runs with a different value, set `PROXY_CONFIRMATION_TIMEOUT` to match (`0` mirrors the proxy's "wait forever"), otherwise the wait here ends before the proxy's does. Give it that long on the calling side too — e.g. `curl --max-time 340` — because a client-side timeout shorter than the approval window reports failure for a trash that may then be approved and go through.
+
+If the operator declines the request at the approval gate — or, on api-proxy `main` today, its approval window expires with no decision, which that build reports the same way (api-proxy #9 gives expiry its own `confirmation_expired` code, which this service treats as a non-decline 403, i.e. HTTP 500) — the response is the documented error envelope (HTTP 200, `success: false`), not an HTTP error. Only the gate's own answer is mapped this way; a 403 for a disabled API key or a blocked path is still a 500 (see [Error Responses](#error-responses)):
+
+```json
+{"success": false, "message": "Email not moved to Trash: the proxy declined the request (approval not granted)", "error": "Operation blocked: Request rejected by operator"}
 ```
 
 ### POST /untrash
@@ -292,14 +302,17 @@ Remove an email from Trash, restoring it to its prior labels.
 
 ```bash
 curl -X POST http://localhost:8081/untrash \
+  --max-time 340 \
   -H "Content-Type: application/json" \
   -d '{"email_id": "18d5a3b2c4e5f6a7"}'
 ```
 
 Response:
 ```json
-{"success": true, "message": "Email removed from Trash"}
+{"success": true, "message": "Email removed from Trash", "error": null}
 ```
+
+This route is approval-gated too: the same wait (`PROXY_CONFIRMATION_TIMEOUT` + 30 s, 330 s by default) and the same `success: false` decline envelope as `POST /trash` apply.
 
 ### POST /batch-summarize
 
@@ -377,7 +390,10 @@ Request body:
 Supported operations:
 - `mark_read` - Remove UNREAD label
 - `archive` - Remove INBOX label
-- `apply_label:LABEL_NAME` - Add the specified label (e.g., `apply_label:IMPORTANT`)
+- `trash` - Move the email to Trash through the proxy's approval-gated trash route (the same path as `POST /trash`). The proxy has no batch approval, so a bulk trash is **one operator approval per message**, decided in sequence; each `trash` waits up to 330 s by default for its decision (see `POST /trash`). A declined message gets `"trash: Operation blocked: Request rejected by operator"` in its `error`, and **the remaining `trash` operations in the request are not attempted**: each is reported as `"trash: not attempted — operator declined an earlier trash in this batch; re-issue if still wanted"` and never sent, because continuing would queue one more prompt per remaining message for an operator who has just said no, each waiting a full approval window. An expired approval window (api-proxy #9's `confirmation_expired`; on api-proxy `main` it arrives as a decline) skips the rest the same way, with `"… the approval window for an earlier trash in this batch expired unanswered; re-issue if still wanted"`. The **ungated operations still run** — `mark_read`, `archive` and `apply_label` on the same or later messages are applied as usual, so a triage batch is not left half-done by one "no". Any other proxy error (a disabled key, a blocked path, a 5xx) keeps the per-operation semantics: reported on that operation, the rest attempted. Applying `TRASH` as a label is not an alternative — see below.
+
+  The per-message results are returned only when the whole request finishes, so a client-side timeout shorter than the request discards the outcomes of trashes the operator already approved (they are in Trash; the response never arrives). Size the client timeout for the number of approvals in the request, or send one `POST /trash` per message when that is not practical.
+- `apply_label:LABEL_NAME` - Add the specified label (e.g., `apply_label:IMPORTANT`); `TRASH`/`SPAM` are rejected (see `POST /apply-label`)
 
 Response:
 ```json
@@ -475,7 +491,7 @@ curl -X DELETE http://localhost:8081/drafts/{draft_id}
 
 Response:
 ```json
-{"success": true, "message": "Draft deleted: r1234567890"}
+{"success": true, "message": "Draft deleted: r1234567890", "error": null}
 ```
 
 ## Proxy Server
@@ -514,6 +530,8 @@ Error prefixes indicate the type:
 - `Authentication error:` - Invalid or missing API key (proxy returned 401)
 - `Operation blocked:` - Operation not allowed or confirmation rejected (proxy returned 403)
 - `Proxy error:` - Backend or server error (proxy returned 5xx)
+
+`POST /trash` and `POST /untrash` return this envelope (HTTP 200, `success: false`, plus a `message`) only when the proxy's approval gate itself answers the request (`{"error": "forbidden", "message": "Request rejected by operator"}` — an operator decline; api-proxy `main` also answers an expired approval window with this body, while api-proxy #9 answers it with `confirmation_expired`, which is not mapped and stays HTTP 500). A proxy 403 with any other body — a disabled API key (`auth_error`), a blocked or non-allowlisted path (`This operation is not allowed`) — is an infrastructure fault no human decided, and stays HTTP 500 with the proxy's text in `detail`. Other failures on the single-action endpoints (`/mark-read`, `/apply-label`, `/archive`, `/trash`, `/untrash`) are still HTTP 500 with a `detail` string.
 
 ## Development
 

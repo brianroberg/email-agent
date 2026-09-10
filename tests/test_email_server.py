@@ -2541,3 +2541,317 @@ class TestProxyErrorHandling:
 
         assert data["success"] is False
         assert "Proxy error" in data["error"]
+
+
+class TestResolveLabelIdRefusesTrashSpam:
+    """The TRASH/SPAM refusal lives in resolve_label_id itself (one place),
+    so every route that resolves a label -- /apply-label, /bulk-actions, and
+    any future label route -- inherits it instead of re-implementing it.
+    Applying TRASH/SPAM as a label bypasses the proxy's approval gate for
+    destructive operations (api-proxy#2); POST /trash is the gated path."""
+
+    @pytest.mark.parametrize("label", ["TRASH", "SPAM", "trash", "Spam"])
+    def test_refuse_trash_spam_is_a_pure_string_rule(self, label):
+        """The refusal is a pure function of the label name: testable with
+        no client, no mock, no event loop."""
+        from email_server import refuse_trash_spam
+
+        with pytest.raises(ValueError, match="/trash"):
+            refuse_trash_spam(label)
+
+    @pytest.mark.parametrize("label", ["STARRED", "INBOX", "Work", ""])
+    def test_refuse_trash_spam_lets_other_labels_through(self, label):
+        from email_server import refuse_trash_spam
+
+        assert refuse_trash_spam(label) is None
+
+    async def test_resolve_label_id_refuses_before_any_proxy_round_trip(self):
+        """The choke-point property: every label route resolves through
+        resolve_label_id, and the refusal runs there before any I/O."""
+        from email_server import resolve_label_id
+
+        mock_proxy_client = AsyncMock()
+        with pytest.raises(ValueError, match="/trash"):
+            await resolve_label_id(mock_proxy_client, "TRASH")
+        mock_proxy_client.list_labels.assert_not_called()
+
+    async def test_resolve_label_id_still_resolves_other_system_labels(self):
+        from email_server import resolve_label_id
+
+        mock_proxy_client = AsyncMock()
+        assert await resolve_label_id(mock_proxy_client, "starred") == "STARRED"
+        mock_proxy_client.list_labels.assert_not_called()
+
+
+class TestTrashApprovalDecline:
+    """An operator DECLINE at the proxy's approval gate is a normal outcome of
+    a gated operation, not a server fault. The proxy answers it with
+    403 {"error": "forbidden", "message": "Request rejected by operator"}
+    (the same 403 when its approval window expires). /trash and /untrash
+    must surface that in the README's documented error envelope
+    (success=false + an "Operation blocked:" error), not as HTTP 500."""
+
+    @patch("email_server.get_gmail_client")
+    @pytest.mark.parametrize("route,method", [
+        ("/trash", "trash_message"),
+        ("/untrash", "untrash_message"),
+    ])
+    def test_operator_decline_returns_documented_envelope(
+        self, mock_get_client, client, route, method
+    ):
+        from proxy_client import ProxyForbiddenError
+
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        getattr(mock_proxy_client, method).side_effect = ProxyForbiddenError(
+            "Request rejected by operator", code="forbidden"
+        )
+
+        response = client.post(route, json={"email_id": "msg123"})
+        assert response.status_code == 200, response.text
+
+        data = response.json()
+        assert data["success"] is False
+        assert data["error"].startswith("Operation blocked:")
+        assert "Request rejected by operator" in data["error"]
+        assert "approval not granted" in data["message"]
+
+    @patch("email_server.get_gmail_client")
+    @pytest.mark.parametrize("route,method", [
+        ("/trash", "trash_message"),
+        ("/untrash", "untrash_message"),
+    ])
+    @pytest.mark.parametrize("message,code", [
+        ("API key is disabled", "auth_error"),          # proxy auth.py: disabled key
+        ("This operation is not allowed", "forbidden"),  # proxy main.py: blocked/non-allowlisted path
+        ("Request rejected by operator", None),          # 403 whose body could not be parsed
+    ])
+    def test_non_decline_403_is_still_a_500(
+        self, mock_get_client, client, route, method, message, code
+    ):
+        """A proxy 403 that is not the approval gate's answer -- a disabled
+        API key, a blocked or non-allowlisted path -- is a service fault.
+        Reporting it in the decline envelope would tell the operator he
+        declined a request he was never shown."""
+        from proxy_client import ProxyForbiddenError
+
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        getattr(mock_proxy_client, method).side_effect = ProxyForbiddenError(
+            message, code=code
+        )
+
+        response = client.post(route, json={"email_id": "msg123"})
+        assert response.status_code == 500, response.text
+        assert response.json()["detail"] == f"Operation blocked: {message}"
+
+    @patch("email_server.get_gmail_client")
+    def test_trash_success_envelope_has_null_error(self, mock_get_client, client):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.trash_message.return_value = {"id": "msg123"}
+
+        data = client.post("/trash", json={"email_id": "msg123"}).json()
+        assert data["success"] is True
+        assert data["error"] is None
+
+    @patch("email_server.get_gmail_client")
+    def test_trash_non_gate_failures_still_500(self, mock_get_client, client):
+        """Only the gate decision is mapped; a broken proxy is still a 500."""
+        from proxy_client import ProxyError
+
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.trash_message.side_effect = ProxyError("Proxy error: 502")
+
+        response = client.post("/trash", json={"email_id": "msg123"})
+        assert response.status_code == 500
+
+
+class TestBulkActionsTrash:
+    """`trash` as a /bulk-actions operation. Each message goes through
+    client.trash_message -- the proxy's approval-gated trash route -- so a
+    bulk trash is N gated calls (the proxy has no batch approval), never
+    the ungated TRASH-label trick."""
+
+    @patch("email_server.get_gmail_client")
+    def test_bulk_trash_routes_each_message_through_gated_trash(
+        self, mock_get_client, client
+    ):
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+
+        response = client.post("/bulk-actions", json={
+            "actions": [
+                {"email_id": "msg_a", "operations": ["trash"]},
+                {"email_id": "msg_b", "operations": ["mark_read", "trash"]},
+            ]
+        })
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["error_count"] == 0, data
+        assert data["success_count"] == 2
+
+        trashed = [c.args[0] for c in mock_proxy_client.trash_message.call_args_list]
+        assert trashed == ["msg_a", "msg_b"]
+        # mark_read is the only label modification; TRASH is never a label here.
+        mock_proxy_client.modify_message.assert_called_once()
+        for c in mock_proxy_client.modify_message.call_args_list:
+            assert "TRASH" not in (c.kwargs.get("add_label_ids") or [])
+
+    @patch("email_server.get_gmail_client")
+    def test_bulk_decline_skips_only_the_remaining_gated_ops(self, mock_get_client, client):
+        """An operator decline on one trash means the remaining *gated*
+        operations in the request (the other trashes) are reported as not
+        attempted and never sent -- continuing would queue one more prompt
+        per remaining message for an operator who has just said no, each
+        waiting a full approval window. The ungated operations (mark_read,
+        archive, apply_label) carry on: a triage batch mixes both, and
+        skipping them would leave mail unread or in the inbox for the
+        caller to re-issue."""
+        from proxy_client import ProxyForbiddenError
+
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.trash_message.side_effect = ProxyForbiddenError(
+            "Request rejected by operator", code="forbidden"
+        )
+
+        data = client.post("/bulk-actions", json={
+            "actions": [
+                {"email_id": "msg_a", "operations": ["mark_read", "trash"]},
+                {"email_id": "msg_b", "operations": ["archive", "trash"]},
+                {"email_id": "msg_c", "operations": ["mark_read"]},
+            ]
+        }).json()
+
+        assert data["success"] is True  # overall request always 200s
+        assert data["success_count"] == 1
+        assert data["error_count"] == 2
+        # msg_a: mark_read succeeded, trash is the decline -- nothing else in its error
+        assert data["results"][0]["success"] is False
+        assert data["results"][0]["error"] == "trash: Operation blocked: Request rejected by operator"
+        # msg_b: archive (ungated) still ran; only its trash was skipped
+        assert data["results"][1]["success"] is False
+        assert data["results"][1]["error"] == (
+            "trash: not attempted — operator declined an earlier trash in this batch; "
+            "re-issue if still wanted"
+        )
+        # msg_c: ungated work after the decline is unaffected
+        assert data["results"][2]["success"] is True
+
+        # Only the first trash reached the proxy ...
+        mock_proxy_client.trash_message.assert_called_once_with("msg_a")
+        # ... while every ungated operation did, including those after the decline.
+        removed = [c.kwargs.get("remove_label_ids") for c in mock_proxy_client.modify_message.call_args_list]
+        assert removed == [["UNREAD"], ["INBOX"], ["UNREAD"]]
+
+    @patch("email_server.get_gmail_client")
+    def test_bulk_all_gated_decline_still_stops(self, mock_get_client, client):
+        """The pure-refusal case: a batch of nothing but trashes sends one
+        prompt, and after the decline sends no more."""
+        from proxy_client import ProxyForbiddenError
+
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.trash_message.side_effect = ProxyForbiddenError(
+            "Request rejected by operator", code="forbidden"
+        )
+
+        data = client.post("/bulk-actions", json={
+            "actions": [
+                {"email_id": "msg_a", "operations": ["trash"]},
+                {"email_id": "msg_b", "operations": ["trash"]},
+                {"email_id": "msg_c", "operations": ["trash"]},
+            ]
+        }).json()
+
+        assert data["success_count"] == 0
+        assert data["error_count"] == 3
+        assert "trash: Operation blocked: Request rejected by operator" in data["results"][0]["error"]
+        assert "trash: not attempted — operator declined an earlier trash" in data["results"][1]["error"]
+        assert "trash: not attempted — operator declined an earlier trash" in data["results"][2]["error"]
+        mock_proxy_client.trash_message.assert_called_once_with("msg_a")
+        mock_proxy_client.modify_message.assert_not_called()
+
+    @patch("email_server.get_gmail_client")
+    def test_bulk_expired_window_skips_remaining_gated_ops_too(self, mock_get_client, client):
+        """api-proxy #9 answers an expired approval window with its own 403
+        (`confirmation_expired`) instead of the decline body. That is the
+        absent-operator case this rule exists for, so it skips the remaining
+        gated operations exactly as a decline does -- with its own reason --
+        and the ungated ones still run."""
+        from proxy_client import ProxyForbiddenError
+
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.trash_message.side_effect = ProxyForbiddenError(
+            "Confirmation request expired before an operator responded",
+            code="confirmation_expired",
+        )
+
+        data = client.post("/bulk-actions", json={
+            "actions": [
+                {"email_id": "msg_a", "operations": ["trash"]},
+                {"email_id": "msg_b", "operations": ["mark_read", "trash"]},
+            ]
+        }).json()
+
+        assert data["error_count"] == 2
+        assert data["results"][0]["error"] == (
+            "trash: Operation blocked: Confirmation request expired before an operator responded"
+        )
+        assert data["results"][1]["error"] == (
+            "trash: not attempted — the approval window for an earlier trash in this batch "
+            "expired unanswered; re-issue if still wanted"
+        )
+        mock_proxy_client.trash_message.assert_called_once_with("msg_a")
+        mock_proxy_client.modify_message.assert_called_once()  # msg_b's mark_read ran
+
+    @patch("email_server.get_gmail_client")
+    def test_bulk_non_gate_403_keeps_per_op_semantics(self, mock_get_client, client):
+        """A disabled key or blocked path is a 403 too, but not the gate's
+        answer: it fails fast with no prompt queued, so each operation is
+        attempted and reports the proxy's real reason -- the per-operation
+        semantics every other proxy error has."""
+        from proxy_client import ProxyForbiddenError
+
+        mock_proxy_client = AsyncMock()
+        mock_get_client.return_value = mock_proxy_client
+        mock_proxy_client.trash_message.side_effect = ProxyForbiddenError(
+            "API key is disabled", code="auth_error"
+        )
+
+        data = client.post("/bulk-actions", json={
+            "actions": [
+                {"email_id": "msg_a", "operations": ["trash"]},
+                {"email_id": "msg_b", "operations": ["trash"]},
+            ]
+        }).json()
+
+        assert data["error_count"] == 2
+        assert data["results"][0]["error"] == "trash: Operation blocked: API key is disabled"
+        assert data["results"][1]["error"] == "trash: Operation blocked: API key is disabled"
+        assert "not attempted" not in data["results"][1]["error"]
+        trashed = [c.args[0] for c in mock_proxy_client.trash_message.call_args_list]
+        assert trashed == ["msg_a", "msg_b"]
+
+
+class TestBulkOperationsSchemaListsEveryOperation:
+    """The OpenAPI description of EmailAction.operations is what a caller
+    reading /openapi.json sees; it must name every BulkOperation member
+    (plus the apply_label:NAME form), or a caller concludes bulk trash is
+    unsupported and falls back to N single calls -- or to apply_label:TRASH,
+    which is refused."""
+
+    def test_openapi_operations_description_names_every_bulk_operation(self, client):
+        from email_server import BulkOperation
+
+        schema = client.get("/openapi.json").json()
+        description = schema["components"]["schemas"]["EmailAction"]["properties"]["operations"]["description"]
+        for member in BulkOperation:
+            assert f"'{member.value}'" in description, (
+                f"{member.value!r} missing from the operations description: {description!r}"
+            )
+        assert "'apply_label:LABEL_NAME'" in description
