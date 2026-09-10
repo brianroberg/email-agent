@@ -81,7 +81,7 @@ The test suite uses mocked proxy client and LLM responses - no credentials requi
 - `POST /drafts/create` - Create a new email draft from structured fields (reply drafts auto-attach to the original Gmail thread via `in_reply_to`/`references` resolution)
 - `GET /drafts` - List all drafts with preview info
 - `GET /drafts/{draft_id}` - Get full details of a specific draft
-- `POST /drafts/{draft_id}/update` - Update an existing draft (preserves the draft's current thread by default; pass `thread_id` to move it or `attach_to_thread: false` to detach). Cross-checks the result's actual draft id and (when available) Subject header against the request; a mismatch is flagged with a `(warning: ...)` note rather than trusted silently.
+- `POST /drafts/{draft_id}/update` - Update an existing draft (preserves the draft's current thread by default; pass `thread_id` to move it or `attach_to_thread: false` to detach). Cross-checks the result's actual draft id against the request and reads the draft back (`format=raw`) to compare its stored Subject, To/Cc/Bcc and plain-text body with what was sent; a difference is a `draft content mismatch` warning, an unreadable/undecodable read-back a `could not verify` warning. Every warning is reported in `warnings` (and as a `(warning: ...)` note in `message`) on a `success: true` response — post-write checks never fail an update that landed (structurally: nothing after the write shares a `try` with the failure mapping). `id_changed` flags a reissued id.
 - `DELETE /drafts/{draft_id}` - Delete a draft permanently
 
 ## Environment Variables

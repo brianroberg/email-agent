@@ -34,6 +34,14 @@ class ProxyError(Exception):
     pass
 
 
+class ProxyNotFoundError(ProxyError):
+    """Raised when the proxy returns 404: the addressed Gmail resource does
+    not exist (any more). A ProxyError subclass, so existing handlers that
+    catch ProxyError keep working; callers that need to tell "gone" from
+    "failed" catch this first."""
+    pass
+
+
 class GmailProxyClient:
     """Client for Gmail API operations through a proxy server.
 
@@ -84,6 +92,7 @@ class GmailProxyClient:
         Raises:
             ProxyAuthError: For 401 responses.
             ProxyForbiddenError: For 403 responses.
+            ProxyNotFoundError: For 404 responses (a ProxyError).
             ProxyError: For 5xx or other error responses.
         """
         if response.status_code == 401:
@@ -97,6 +106,10 @@ class GmailProxyClient:
         if response.status_code >= 500:
             message = self._parse_error_message(response, f"Proxy error: {response.status_code}")
             raise ProxyError(message)
+
+        if response.status_code == 404:
+            message = self._parse_error_message(response, "Request error: 404")
+            raise ProxyNotFoundError(message)
 
         if response.status_code >= 400:
             message = self._parse_error_message(response, f"Request error: {response.status_code}")
