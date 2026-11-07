@@ -1,5 +1,7 @@
 # Email Agent v2 — Implementation Plan
 
+> **Note (authentication):** this plan predates the bearer-token requirement. In its default mode the service now needs `Authorization: Bearer <token>` on every route except `/health` (see "Authentication" in `README.md`), so the `curl` commands and the skill instructions below need that header added.
+
 ## Background
 
 This plan describes a new email agent server to replace an existing one built on Microsoft Agent Framework (MAF). The existing agent wraps Gmail API access behind an LLM-powered agent loop — a local 14B model (Qwen3-14B via MLX) decides which Gmail tools to call based on natural-language prompts. This is unreliable because the 14B model struggles with tool-calling decisions.

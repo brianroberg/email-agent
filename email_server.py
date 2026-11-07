@@ -26,6 +26,17 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from auth import (
+    AuthConfigError,
+    AuthSettings,
+    BearerAuthMiddleware,
+    SettingsFromEnvironment,
+    StderrLogging,
+    declare_bearer_scheme,
+    load_auth_settings,
+    logger as auth_logger,
+    startup_messages,
+)
 from gmail_utils import (
     get_header,
     normalize_header_text,
@@ -91,6 +102,30 @@ def strip_think_tags(text: str) -> str:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    # Read the authentication settings once, here, so a bad configuration
+    # stops the service before it serves a request. If this raises, nothing
+    # below runs; single-process uvicorn then exits before reporting that it
+    # is running, while under --workers or --reload the parent process keeps
+    # the port and each worker exits here.
+    try:
+        auth_settings = load_auth_settings(os.environ)
+    except AuthConfigError as e:
+        print(f"email-agent: ERROR refusing to start: {e}", file=sys.stderr, flush=True)
+        raise
+    auth_logging = StderrLogging()
+    auth_logging.install()
+    for level, message in startup_messages(auth_settings):
+        auth_logger.log(level, message)
+    _app.state.auth_settings = auth_settings
+    try:
+        _print_llm_banner()
+        yield
+    finally:
+        _app.state.auth_settings = None
+        auth_logging.remove()
+
+
+def _print_llm_banner() -> None:
     # Log the LLM configuration once, when the server actually starts —
     # not on every import of this module.
     print(
@@ -108,10 +143,48 @@ async def lifespan(_app: FastAPI):
             file=sys.stderr,
             flush=True,
         )
-    yield
 
 
 app = FastAPI(title="Email Agent Server v2", version="2.0", lifespan=lifespan)
+
+# The only paths served without a bearer token. Everything else -- every
+# route below, the documentation routes, and any path that is not a route at
+# all -- goes through the token check, because the check wraps the whole
+# application rather than being attached to routes one by one.
+AUTH_EXEMPT_PATHS = frozenset({"/health"})
+
+
+# Used only when the start-up hook has not loaded the settings: reads the
+# environment once, at the first request that needs it, and keeps the result
+# for the life of the process (see auth.SettingsFromEnvironment).
+_fallback_auth_settings = SettingsFromEnvironment(os.environ)
+
+
+def _auth_settings() -> AuthSettings | None:
+    """The settings the token check uses for a request: the ones the
+    start-up hook loaded, or, if the application is being driven without its
+    start-up hook, the fallback's. None means they could not be loaded, and
+    the check answers 503."""
+    loaded = getattr(app.state, "auth_settings", None)
+    return loaded if loaded is not None else _fallback_auth_settings()
+
+
+app.add_middleware(
+    BearerAuthMiddleware,
+    get_settings=_auth_settings,
+    exempt_paths=AUTH_EXEMPT_PATHS,
+)
+
+_fastapi_openapi = app.openapi
+
+
+def _openapi_with_bearer_scheme() -> dict:
+    """The generated OpenAPI document, declaring the bearer scheme so a
+    client can see that a token is needed."""
+    return declare_bearer_scheme(_fastapi_openapi(), AUTH_EXEMPT_PATHS)
+
+
+app.openapi = _openapi_with_bearer_scheme  # type: ignore[method-assign]
 
 
 class LLMError(Exception):

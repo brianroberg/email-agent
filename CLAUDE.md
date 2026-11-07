@@ -43,12 +43,16 @@ The test suite uses mocked proxy client and LLM responses - no credentials requi
 ## Project Structure
 
 - `email_server.py` - Main FastAPI application with all endpoints
+- `auth.py` - Bearer-token authentication: settings parsing, the allow/refuse decision, and the ASGI middleware that wraps the whole application
 - `proxy_client.py` - Gmail API proxy client (handles proxy authentication and requests)
 - `gmail_utils.py` - Gmail message parsing utilities (header extraction, body decoding)
 - `message_builder.py` - RFC 2822 email construction for draft creation (base64url encoding for Gmail API)
 - `.env.example` - Template for environment variables
 - `tests/` - Test suite
-  - `conftest.py` - Shared fixtures and sample data
+  - `conftest.py` - Shared fixtures and sample data (an autouse fixture sets auth to `required` with one synthetic token; the `client` fixture sends it, `anonymous_client` does not)
+  - `test_auth.py` - Settings parsing, the allow/refuse decision, the middleware on its own
+  - `test_auth_enforcement.py` - The token requirement through the real application, including a walk over the app's own route list
+  - `test_auth_startup.py` - Start-up refusal and messages, and the documented start command run on a loopback port
   - `test_email_server.py` - Endpoint and utility tests
   - `test_drafts.py` - Draft endpoint and message builder tests
   - `test_readme_documentation.py` - Verifies all endpoints are documented in README
@@ -64,9 +68,13 @@ The test suite uses mocked proxy client and LLM responses - no credentials requi
 
 4. **Structured endpoints**: Each operation has a dedicated endpoint rather than a single natural-language endpoint.
 
+5. **Caller authentication in front of the app, default deny**: `BearerAuthMiddleware` (`auth.py`) wraps the whole application and checks `Authorization: Bearer <token>` before routing. The paths served without a token are listed in `AUTH_EXEMPT_PATHS` in `email_server.py` (`/health`). A new route needs nothing added to be protected; do not add per-route auth dependencies. `tests/test_auth_enforcement.py` walks `app.routes` and fails if any operation other than `GET /health` answers without a token. The walk fills path parameters with a placeholder, so it does not see an exempt entry for one concrete path such as `/drafts/r123`; `TestTheExemptList` in the same file pins `AUTH_EXEMPT_PATHS == {"/health"}` exactly, so widening the list means changing that test on purpose.
+
 ## API Endpoints
 
-- `GET /health` - Health check
+All endpoints except `GET /health` need `Authorization: Bearer <token>` in the default mode (see README "Authentication").
+
+- `GET /health` - Health check (no token needed)
 - `GET /labels` - List available Gmail labels with message counts
 - `POST /search` - Search emails with structured filters (returns from_name, to/cc/bcc lists, thread_id, has_attachments, and RFC 2822 rfc822_message_id/in_reply_to/references for reply threading)
 - `POST /summarize` - Summarize an email (uses local LLM)
@@ -89,6 +97,8 @@ The test suite uses mocked proxy client and LLM responses - no credentials requi
 Copy `.env.example` to `.env` and configure:
 
 - `PROXY_API_KEY` - **Required**. API key for authenticating with the proxy server (format: `aproxy_<32-chars>`)
+- `EMAIL_AGENT_API_KEYS` - Tokens for callers of this service: comma-separated `name:token` pairs (name 1-31 characters of letters, digits, `.`, `_`, `-`; token at least 32 printable ASCII characters with no `:`, so each entry has exactly one `:`; names are logged by design). Required in the default mode: with `EMAIL_AGENT_AUTH=required` and no tokens the service refuses to start
+- `EMAIL_AGENT_AUTH` - `required` (default; 401 without a configured token), `optional` (requests without a token are served and logged as warnings; a wrong token is still 401), or `off` (no authentication; warns at start-up; `EMAIL_AGENT_API_KEYS` is not read, so a malformed list does not stop start-up)
 - `PROXY_URL` - URL of the proxy server (default: `http://host.docker.internal:8000`)
 - `PROXY_CONFIRMATION_TIMEOUT` - The proxy's approval window in seconds (its `--confirmation-timeout`; `0` = it waits forever). Must match the proxy; gated calls wait this long plus 30 s (default: `300`)
 - `MLX_URL` - Local LLM endpoint (default: `http://localhost:8080/v1/chat/completions`)
